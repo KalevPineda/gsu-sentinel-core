@@ -14,7 +14,7 @@ El sistema sigue una arquitectura de **Microservicios en el Borde (Edge Computin
 ```mermaid
 graph TD
     subgraph "Capta de Datos (Hardware)"
-        CAM[Cámara Térmica Tiny1-C] -->|USB Raw YUYV| DAEMON[thermal_daemon (C++)]
+        CAM[Cámara Térmica Tiny1-C] -->|USB Raw YUYV| DAEMON[thermal_daemon]
         DAEMON -->|ZeroMQ TCP:5555| CORE
         ESP[ESP32 PTZ Controller] <-->|MQTT TCP:1883| MOSQUITTO[Broker MQTT]
     end
