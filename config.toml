@@ -1,0 +1,16 @@
+[turbine]
+park_id = 15
+turbine_number = 104
+model = "Vestas V90"
+type = "Onshore"
+
+[limits]
+max_temp_warning = 30.0  # Grados Celsius para alerta
+notification_cooldown_min = 30 # Minutos entre alertas
+
+[network]
+zmq_endpoint = "tcp://192.168.0.123:5555"
+mqtt_broker = "192.168.0.123" # Localhost porque corre en la misma RPi
+mqtt_port = 1883
+http_port = 3000
+db_url = "sqlite://gsu.db"
