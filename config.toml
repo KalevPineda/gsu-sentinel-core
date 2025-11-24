@@ -6,7 +6,7 @@ type = "Onshore"
 
 [limits]
 max_temp_warning = 30.0  # Grados Celsius para alerta
-notification_cooldown_min = 30 # Minutos entre alertas
+notification_cooldown_min = 1 # Minutos entre alertas
 
 [network]
 zmq_endpoint = "tcp://192.168.0.123:5555"
