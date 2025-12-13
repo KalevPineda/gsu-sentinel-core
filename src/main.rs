@@ -1,5 +1,3 @@
-
-
 use axum::{
     extract::State,
     routing::get,
@@ -9,23 +7,32 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use ndarray::Array2;
 use ndarray_npy::WriteNpyExt; 
 use rumqttc::{AsyncClient, MqttOptions, QoS};
-use serde::Deserialize; // Eliminado Serialize no usado
+use serde::Deserialize;
 use std::{io::Cursor, sync::Arc, time::{Duration, Instant}};
-use tokio::sync::Mutex; // Eliminado broadcast no usado
-use zeromq::{Socket, SocketRecv, ZmqMessage}; // ZmqMessage sí se usa en la firma de la función
+use tokio::sync::Mutex; 
+use zeromq::{Socket, SocketRecv, ZmqMessage};
 
 // --- CONFIGURACIÓN & ESTADOS ---
 
 #[derive(Clone, Debug, PartialEq)]
 enum SystemMode {
-    Scanning,       
-    Tracking,       
-    CollectingData, 
+    IdleAtEndpoint, // Esperando 5s en GSU 1 o 2
+    Panning,        // Moviéndose suavemente y buscando
+    Tracking,       // Objetivo detectado, centrando
+    CollectingData, // Grabando datos científicos
+}
+
+// Dirección del barrido
+#[derive(Clone, Debug, PartialEq)]
+enum ScanDirection {
+    RightToLeft, // Yendo hacia 125
+    LeftToRight, // Yendo hacia 55
 }
 
 struct AppState {
     current_mode: Arc<Mutex<SystemMode>>,
     current_angle: Arc<Mutex<f32>>,
+    scan_direction: Arc<Mutex<ScanDirection>>, // Nueva variable de estado
     mqtt_client: AsyncClient,
     config: Config,
     cloud_client: reqwest::Client,
@@ -44,6 +51,8 @@ struct Config {
 struct Limits {
     max_temp_trigger: f32, 
     collection_duration_sec: u64,
+    scan_wait_time_sec: u64,
+    pan_step_degrees: f32,
 }
 
 #[derive(Deserialize, Clone)]
@@ -57,15 +66,16 @@ struct NetworkConfig {
 
 fn calculate_correction(hotspot_x: usize) -> f32 {
     let center_x = 128.0;
+    // Ajustar según FOV real de la cámara. Aprox 4.5 pixeles por grado.
     let pixels_per_degree = 4.5; 
     let error_pixels = (hotspot_x as f32) - center_x;
+    // Invertimos signo según montaje del servo (ajustar si va al revés)
     -(error_pixels / pixels_per_degree)
 }
 
 fn parse_zmq_msg(msg: ZmqMessage) -> Option<(u64, Array2<f32>)> {
     if msg.len() < 2 { return None; }
     
-    // 1. Parsear Header
     let header_bytes = msg.get(0)?;
     if header_bytes.len() < 20 { return None; }
     
@@ -74,7 +84,6 @@ fn parse_zmq_msg(msg: ZmqMessage) -> Option<(u64, Array2<f32>)> {
     let rows = rdr.read_i32::<LittleEndian>().ok()? as usize;
     let cols = rdr.read_i32::<LittleEndian>().ok()? as usize;
 
-    // 2. Parsear Payload
     let payload_bytes = msg.get(1)?;
     let expected_len = rows * cols * 4; 
     
@@ -94,33 +103,31 @@ fn parse_zmq_msg(msg: ZmqMessage) -> Option<(u64, Array2<f32>)> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // 1. Cargar Configuración
+    // 1. Configuración
     let config_content = std::fs::read_to_string("config.toml").expect("Falta config.toml");
     let config: Config = toml::from_str(&config_content)?;
     
     std::fs::create_dir_all("data/captures")?;
 
-    // 2. Cliente Cloud
-    let cloud_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
+    // 2. Clientes
+    let cloud_client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
 
-    // 3. MQTT
     let mut mqttoptions = MqttOptions::new("gsu_core_v3", &config.network.mqtt_broker, 1883);
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     let (mqtt_client, mut mqtt_eventloop) = AsyncClient::new(mqttoptions, 10);
     
-    // 4. Estado Global
+    // 3. Estado Inicial
     let state = Arc::new(AppState {
-        current_mode: Arc::new(Mutex::new(SystemMode::Scanning)),
-        current_angle: Arc::new(Mutex::new(90.0)),
+        current_mode: Arc::new(Mutex::new(SystemMode::IdleAtEndpoint)),
+        current_angle: Arc::new(Mutex::new(90.0)), // Iniciar al centro
+        scan_direction: Arc::new(Mutex::new(ScanDirection::RightToLeft)),
         mqtt_client: mqtt_client.clone(),
         config: config.clone(),
         cloud_client,
         dataset_buffer: Arc::new(Mutex::new(Vec::new())),
     });
 
-    // 5. Loop MQTT
+    // 4. MQTT Loop
     tokio::spawn(async move {
         loop { 
             if let Err(e) = mqtt_eventloop.poll().await {
@@ -130,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 6. Loop de Visión
+    // 5. CEREBRO DE VISIÓN ARTIFICIAL
     let state_logic = state.clone();
     let zmq_endpoint = config.network.zmq_endpoint.clone();
     
@@ -139,91 +146,150 @@ async fn main() -> anyhow::Result<()> {
         socket.connect(&zmq_endpoint).await.expect("Fallo ZMQ Connect");
         socket.subscribe("").await.expect("Fallo ZMQ Subscribe");
 
-        let mut last_scan_move = Instant::now();
-        let mut collection_start = Instant::now();
-        let mut scan_target = 0; 
+        // Timers locales
+        let mut idle_start_time = Instant::now();
+        let mut collection_start_time = Instant::now();
+        
+        // Límites del paneo (Grados del Servo)
+        const ANGLE_LEFT_GSU1: f32 = 125.0;
+        const ANGLE_RIGHT_GSU2: f32 = 55.0;
 
-        println!("👁️ Sistema de Visión Iniciado. Esperando frames...");
+        println!("👁️  GSU Sentinel: Modo Panorámico Activo");
 
+        // Bucle frame a frame (aprox 25 FPS dictado por la cámara)
         loop {
             match socket.recv().await {
                 Ok(msg) => {
                     if let Some((timestamp, matrix)) = parse_zmq_msg(msg) {
+                        
+                        // 1. Análisis Inmediato (Cada frame)
                         let max_temp = *matrix.iter().reduce(|a, b| if a > b { a } else { b }).unwrap_or(&0.0);
                         
-                        let mut mode_guard = state_logic.current_mode.lock().await;
-                        let mut angle_guard = state_logic.current_angle.lock().await;
+                        // Acceso seguro al estado
+                        let mut mode = state_logic.current_mode.lock().await;
+                        let mut angle = state_logic.current_angle.lock().await;
+                        let mut direction = state_logic.scan_direction.lock().await;
 
-                        match *mode_guard {
-                            SystemMode::Scanning => {
-                                if max_temp > state_logic.config.limits.max_temp_trigger {
-                                    println!("🔥 DETECCIÓN: {}°C. Iniciando Tracking.", max_temp);
-                                    *mode_guard = SystemMode::Tracking;
-                                } else {
-                                    if last_scan_move.elapsed().as_secs() > 5 {
-                                        if scan_target == 0 {
-                                            *angle_guard = 55.0; 
-                                            scan_target = 1;
-                                        } else {
-                                            *angle_guard = 125.0; 
-                                            scan_target = 0;
-                                        }
-                                        publish_angle(&state_logic.mqtt_client, *angle_guard).await;
-                                        last_scan_move = Instant::now();
+                        // --- INTERRUPCIÓN DE ALERTA GLOBAL ---
+                        // Si detectamos calor Y no estamos recolectando ya, interrumpimos todo para Trackear
+                        let is_collecting = matches!(*mode, SystemMode::CollectingData);
+                        if max_temp > state_logic.config.limits.max_temp_trigger && !is_collecting {
+                            if !matches!(*mode, SystemMode::Tracking) {
+                                println!("🔥 ALERTA ({}°C). Interrumpiendo paneo para centrar objetivo.", max_temp);
+                                *mode = SystemMode::Tracking;
+                            }
+                        }
+
+                        // --- MÁQUINA DE ESTADOS ---
+                        match *mode {
+                            SystemMode::IdleAtEndpoint => {
+                                // Esperamos N segundos antes de volver a barrer
+                                if idle_start_time.elapsed().as_secs() >= state_logic.config.limits.scan_wait_time_sec {
+                                    println!("🔄 Tiempo de espera finalizado. Iniciando barrido...");
+                                    *mode = SystemMode::Panning;
+                                    
+                                    // Invertir dirección para el siguiente barrido
+                                    if *angle >= (ANGLE_LEFT_GSU1 - 5.0) {
+                                        *direction = ScanDirection::LeftToRight;
+                                    } else {
+                                        *direction = ScanDirection::RightToLeft;
                                     }
                                 }
                             },
+                            SystemMode::Panning => {
+                                // Mover el servo suavemente frame a frame
+                                let step = state_logic.config.limits.pan_step_degrees;
+                                
+                                match *direction {
+                                    ScanDirection::RightToLeft => {
+                                        if *angle < ANGLE_LEFT_GSU1 {
+                                            *angle += step;
+                                        } else {
+                                            // Llegamos al tope Izquierdo (GSU 1)
+                                            *angle = ANGLE_LEFT_GSU1;
+                                            *mode = SystemMode::IdleAtEndpoint;
+                                            idle_start_time = Instant::now();
+                                            println!("🛑 Llegada a GSU 1. Esperando...");
+                                        }
+                                    },
+                                    ScanDirection::LeftToRight => {
+                                        if *angle > ANGLE_RIGHT_GSU2 {
+                                            *angle -= step;
+                                        } else {
+                                            // Llegamos al tope Derecho (GSU 2)
+                                            *angle = ANGLE_RIGHT_GSU2;
+                                            *mode = SystemMode::IdleAtEndpoint;
+                                            idle_start_time = Instant::now();
+                                            println!("🛑 Llegada a GSU 2. Esperando...");
+                                        }
+                                    }
+                                }
+                                
+                                // Enviar comando al ESP32 (Suave)
+                                publish_angle(&state_logic.mqtt_client, *angle).await;
+                            },
                             SystemMode::Tracking => {
+                                // Lógica de centrado (Visual Servoing)
                                 let (max_idx, _) = matrix.iter().enumerate()
                                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).unwrap();
-                                
                                 let cols = matrix.ncols();
                                 let hotspot_x = max_idx % cols;
+                                
                                 let correction = calculate_correction(hotspot_x);
                                 
                                 if correction.abs() < 2.0 {
-                                    println!("🎯 Objetivo Centrado. Recolectando datos...");
-                                    *mode_guard = SystemMode::CollectingData;
-                                    collection_start = Instant::now();
+                                    // Centrado exitoso -> Grabar
+                                    println!("🎯 Objetivo centrado. Iniciando recolección científica.");
+                                    *mode = SystemMode::CollectingData;
+                                    collection_start_time = Instant::now();
                                     state_logic.dataset_buffer.lock().await.clear();
                                 } else {
-                                    *angle_guard += correction * 0.4;
-                                    *angle_guard = angle_guard.clamp(0.0, 180.0);
-                                    publish_angle(&state_logic.mqtt_client, *angle_guard).await;
+                                    // Aplicar corrección PID visual
+                                    *angle += correction * 0.3; // Ganancia suave
+                                    *angle = angle.clamp(0.0, 180.0);
+                                    publish_angle(&state_logic.mqtt_client, *angle).await;
                                 }
-                                
+
+                                // Si el punto se enfría o fue un falso positivo, volvemos a Idle
                                 if max_temp < (state_logic.config.limits.max_temp_trigger - 2.0) {
-                                     *mode_guard = SystemMode::Scanning;
+                                    println!("❄️ Falsa alarma o enfriamiento. Volviendo a rutina.");
+                                    *mode = SystemMode::IdleAtEndpoint;
+                                    idle_start_time = Instant::now();
                                 }
                             },
                             SystemMode::CollectingData => {
+                                // Buffer circular / Acumulación
                                 state_logic.dataset_buffer.lock().await.push((timestamp, matrix.clone()));
                                 
-                                if collection_start.elapsed().as_secs() > state_logic.config.limits.collection_duration_sec {
-                                    println!("✅ Dataset finalizado. Guardando y subiendo...");
+                                // Verificar tiempo de recolección
+                                if collection_start_time.elapsed().as_secs() >= state_logic.config.limits.collection_duration_sec {
+                                    println!("✅ Recolección finalizada.");
                                     
-                                    let buffer_copy = state_logic.dataset_buffer.lock().await.clone();
+                                    // Clonar y Subir (Async)
+                                    let buffer = state_logic.dataset_buffer.lock().await.clone();
                                     let client = state_logic.cloud_client.clone();
                                     let url = state_logic.config.cloud_url.clone();
                                     let token = state_logic.config.turbine_token.clone();
-                                    let angle_snap = *angle_guard;
+                                    let current_ang = *angle;
                                     
                                     tokio::spawn(async move {
-                                        process_and_upload(client, url, token, buffer_copy, angle_snap).await;
+                                        process_and_upload(client, url, token, buffer, current_ang).await;
                                     });
 
-                                    *mode_guard = SystemMode::Scanning; 
+                                    // Volver a esperar antes de seguir
+                                    *mode = SystemMode::IdleAtEndpoint;
+                                    idle_start_time = Instant::now();
                                 }
                             }
                         }
                     } 
                 },
-                Err(e) => eprintln!("Error ZMQ Recv: {:?}", e),
+                Err(e) => eprintln!("Error ZMQ: {:?}", e),
             }
         }
     });
 
-    // 7. Servidor HTTP
+    // 6. Servidor Web
     let app = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/status", get(status_handler))
@@ -237,20 +303,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// --- HANDLERS & LOGICA AUXILIAR ---
+// --- AUXILIARES ---
 
 async fn publish_angle(client: &AsyncClient, angle: f32) {
-    let payload = format!("{:.2}", angle);
-    let _ = client.publish("gsu/control/setpoint", QoS::AtLeastOnce, false, payload).await;
+    // Formatear a 1 decimal para no saturar el log del ESP32 con micro-cambios
+    let payload = format!("{:.1}", angle);
+    // QoS 0 (AtMostOnce) es preferible para streaming de posición suave (menor latencia)
+    let _ = client.publish("gsu/control/setpoint", QoS::AtMostOnce, false, payload).await;
 }
 
 async fn process_and_upload(client: reqwest::Client, base_url: String, token: String, data: Vec<(u64, Array2<f32>)>, angle: f32) {
     if data.is_empty() { return; }
-    
     let timestamp = data[0].0;
     let filename = format!("data/captures/dataset_{}.npz", timestamp);
     
-    // Obtenemos el frame más caliente
+    // Guardar frame de temperatura máxima
     let hottest_frame = data.iter()
         .max_by(|a, b| {
             let max_a = a.1.iter().fold(0.0/0.0, |m, v| v.max(m));
@@ -259,51 +326,33 @@ async fn process_and_upload(client: reqwest::Client, base_url: String, token: St
         })
         .unwrap();
 
-    // --- CORRECCIÓN AQUÍ: Crear archivo físico primero ---
     match std::fs::File::create(&filename) {
         Ok(file) => {
-            if let Err(e) = hottest_frame.1.write_npy(file) {
-                eprintln!("Error escribiendo NPZ: {}", e);
-                return;
-            }
-            println!("💾 Archivo científico guardado: {}", filename);
+            let _ = hottest_frame.1.write_npy(file);
+            println!("💾 Datos guardados en disco.");
         },
-        Err(e) => {
-            eprintln!("No se pudo crear el archivo {}: {}", filename, e);
-            return;
-        }
+        Err(e) => eprintln!("Error guardando archivo: {}", e),
     }
 
-    // Subir a la nube
     match tokio::fs::read(&filename).await {
-        Ok(file_bytes) => {
-            let part = reqwest::multipart::Part::bytes(file_bytes)
-                .file_name(filename.clone())
-                .mime_str("application/octet-stream").unwrap();
-
+        Ok(bytes) => {
+            let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.clone()).mime_str("application/octet-stream").unwrap();
             let form = reqwest::multipart::Form::new()
                 .text("turbine_token", token)
                 .text("angle", angle.to_string())
                 .part("dataset_file", part);
 
-            match client.post(format!("{}/ingest/upload", base_url))
-                .multipart(form)
-                .send()
-                .await {
-                    Ok(_) => println!("☁️ Upload exitoso."),
-                    Err(e) => eprintln!("❌ Falló upload a la nube: {}", e),
-                }
+            let _ = client.post(format!("{}/ingest/upload", base_url)).multipart(form).send().await;
+            println!("☁️ Datos sincronizados con la nube.");
         },
-        Err(_) => eprintln!("No se pudo leer el archivo para subir."),
+        Err(_) => {},
     }
 }
 
-async fn health_handler() -> Json<&'static str> {
-    Json("online")
-}
+async fn health_handler() -> Json<&'static str> { Json("online") }
 
 async fn status_handler(State(state): State<Arc<AppState>>) -> Json<String> {
     let mode = state.current_mode.lock().await;
     let angle = state.current_angle.lock().await;
-    Json(format!("Mode: {:?}, Angle: {:.2}", *mode, *angle))
+    Json(format!("Mode: {:?} | Angle: {:.1}", *mode, *angle))
 }

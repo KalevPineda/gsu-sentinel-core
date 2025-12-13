@@ -1,29 +1,16 @@
-
-
-# --- Configuración General ---
-# URL donde está corriendo tu servidor gsu_sentinel_cloud
-# Si estás probando localmente, usa http://127.0.0.1:8080
-# Si es remoto, pon la IP pública del servidor.
-cloud_url = "http://192.168.0.6:8080"
-
-# Identificador único de este dispositivo para la nube
+cloud_url = "http://192.168.0.11:8080"
 turbine_token = "turbine_104_park_15"
 
-# --- Límites de Control y Ciencia ---
 [limits]
-# Temperatura (Celsius) que activa el modo "Tracking" (Seguimiento)
 max_temp_trigger = 50.0 
+collection_duration_sec = 10 
+# Tiempo de espera al llegar a un extremo (GSU 1 o 2) antes de volver
+scan_wait_time_sec = 5
+# Velocidad del barrido: Grados por frame (aprox 25 FPS)
+# 0.5 grados * 25 fps = 12.5 grados por segundo (Velocidad suave)
+pan_step_degrees = 0.2
 
-# Segundos que la cámara se quedará grabando datos científicos una vez centre el objetivo
-collection_duration_sec = 10
-
-# --- Configuración de Red ---
 [network]
-# Donde escucha el Thermal Daemon (C++)
-zmq_endpoint = "tcp://192.168.0.6:5555"
-
-# Broker MQTT (Mosquitto)
-mqtt_broker = "192.168.0.6"
-
-# Puerto para la API HTTP local y Health Check
+zmq_endpoint = "tcp://127.0.0.1:5555"
+mqtt_broker = "127.0.0.1"
 http_port = 3000
