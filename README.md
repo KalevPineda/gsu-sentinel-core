@@ -1,7 +1,7 @@
 
-# Documentación Técnica: GSU Sentinel Core
+# Documentación Técnica: GCU Sentinel Core
 
-**GSU Sentinel Core** es el backend de alto rendimiento desarrollado en **Rust** para el sistema de monitoreo térmico de aerogeneradores. Actúa como un orquestador central que ingiere datos crudos, procesa imágenes térmicas, gestiona la persistencia de alertas y sirve datos en tiempo real a clientes conectados.
+**GCU Sentinel Core** es el backend de alto rendimiento desarrollado en **Rust** para el sistema de monitoreo térmico de aerogeneradores. Actúa como un orquestador central que ingiere datos crudos, procesa imágenes térmicas, gestiona la persistencia de alertas y sirve datos en tiempo real a clientes conectados.
 
 ---
 
