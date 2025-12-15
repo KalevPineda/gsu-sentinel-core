@@ -1,14 +1,15 @@
 [static_conf]
-cloud_base_url = "http://192.168.0.4:8080" # IP de tu PC/Servidor donde corre gsu_sentinel_cloud
-turbine_token = "TURBINA_NORT_01"
+# AQUÍ ESTÁ LA CORRECCIÓN DE LA IP
+cloud_base_url = "http://209.94.60.160:8080" 
+turbine_token = "GSU_TR_01"
 
 [static_conf.network]
-zmq_endpoint = "tcp://127.0.0.1:5555" # IP de la cámara térmica
-mqtt_broker = "127.0.0.1"             # Broker MQTT (ej. Mosquitto)
+zmq_endpoint = "tcp://127.0.0.1:5555"
+mqtt_broker = "127.0.0.1"
 mqtt_port = 1883
 
 [initial_dynamic]
-max_temp_trigger = 55.0  # Si sube de 55, alerta
-scan_wait_time_sec = 5   # Espera 5s en los bordes
+max_temp_trigger = 55.0
+scan_wait_time_sec = 5
 system_enabled = true
-pan_step_degrees = 0.5   # Velocidad del barrido
+pan_step_degrees = 0.4
