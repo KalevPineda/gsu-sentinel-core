@@ -472,6 +472,7 @@ dependencies = [
  "byteorder",
  "ndarray",
  "ndarray-npy",
+ "parking_lot",
  "reqwest",
  "rumqttc",
  "serde",
@@ -481,6 +482,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeromq",
 ]
 

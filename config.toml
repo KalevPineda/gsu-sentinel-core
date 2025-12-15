@@ -1,16 +1,14 @@
-cloud_url = "http://192.168.0.11:8080"
-turbine_token = "turbine_104_park_15"
+[static_conf]
+cloud_base_url = "http://192.168.0.4:8080" # IP de tu PC/Servidor donde corre gsu_sentinel_cloud
+turbine_token = "TURBINA_NORT_01"
 
-[limits]
-max_temp_trigger = 50.0 
-collection_duration_sec = 10 
-# Tiempo de espera al llegar a un extremo (GSU 1 o 2) antes de volver
-scan_wait_time_sec = 5
-# Velocidad del barrido: Grados por frame (aprox 25 FPS)
-# 0.5 grados * 25 fps = 12.5 grados por segundo (Velocidad suave)
-pan_step_degrees = 0.2
+[static_conf.network]
+zmq_endpoint = "tcp://127.0.0.1:5555" # IP de la cámara térmica
+mqtt_broker = "127.0.0.1"             # Broker MQTT (ej. Mosquitto)
+mqtt_port = 1883
 
-[network]
-zmq_endpoint = "tcp://127.0.0.1:5555"
-mqtt_broker = "127.0.0.1"
-http_port = 3000
+[initial_dynamic]
+max_temp_trigger = 55.0  # Si sube de 55, alerta
+scan_wait_time_sec = 5   # Espera 5s en los bordes
+system_enabled = true
+pan_step_degrees = 0.5   # Velocidad del barrido

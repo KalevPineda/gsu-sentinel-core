@@ -26,3 +26,5 @@ anyhow = "1.0"
 # Communication
 zeromq = "0.4.1" 
 rumqttc = "0.24"
+parking_lot = "0.12" # Better Mutex
+uuid = { version = "1.0", features = ["v4"] }
